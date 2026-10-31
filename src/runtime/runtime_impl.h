@@ -23,6 +23,9 @@ static const char *gs_errmsgs[] = {
     "non-null relative reference encodes as null",
     "pop_n count negative or beyond the array's length",
     "queue limit of zero or less",
+    "invalid array length",
+    "slice not within this array",
+    "slice pool span tree is corrupt",
 };
 
 /* Ends the process with `code`, its streams flushed: exit() and every
@@ -64,22 +67,25 @@ static GS_TLS gs_contained *gs_contain;
    bytes at `msg` and the location after it. A contained worker's keeps the
    message, without the "goose runtime error: " every printed one starts
    with, and ends that worker; anything else's prints it and ends the
-   process. */
+   process. A NULL file is a check the runtime makes on its own, which has
+   no Goose location to print. */
 static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, int line) {
     static const char lead[] = "goose runtime error: ";
     int64_t pre = sizeof lead - 1;
-    int64_t loc = snprintf(NULL, 0, " (%s:%d)\n", file, line);
+    int64_t loc = file ? snprintf(NULL, 0, " (%s:%d)\n", file, line) : 1;
     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
     if (!text) {
         if (gs_contain) gs_panic("out of memory recording an aborted thread");
         fputs(lead, stderr);
         fwrite(msg, 1, (size_t)len, stderr);
-        fprintf(stderr, " (%s:%d)\n", file, line);
+        if (file) fprintf(stderr, " (%s:%d)\n", file, line);
+        else fputc('\n', stderr);
         gs_end(1);
     }
     memcpy(text, lead, (size_t)pre);
     if (len) memcpy(text + pre, msg, (size_t)len);
-    snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
+    if (file) snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
+    else memcpy(text + pre + len, "\n", 2);
     if (gs_contain) {
         memmove(text, text + pre, (size_t)(len + loc - 1));
         gs_contain->msg = text;
@@ -87,6 +93,7 @@ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, 
         gs_longjmp(gs_contain->jump, 1);
     }
     fwrite(text, 1, (size_t)(pre + len + loc), stderr);
+    free(text);
     gs_end(1);
 }
 
@@ -263,6 +270,18 @@ static size_t gs_overflow_text(char *buf, const gs_region *r) {
     return (size_t)(p - buf);
 }
 
+GS_API GS_NORETURN void gs_stack_overflow(const void *at) {
+    for (long i = 0; i < gs_nregions; i++) {
+        const gs_region *r = &gs_regions[i];
+        if ((uintptr_t)at - (uintptr_t)r->base < r->size) {
+            char msg[GS_OVERFLOW_TEXT];
+            fwrite(msg, 1, gs_overflow_text(msg, r), stderr);
+            gs_end(1);
+        }
+    }
+    gs_panic("data stack overflow");
+}
+
 /* The calling thread program's registry, empty, as it starts. */
 static void gs_regions_begin(int64_t capacity) {
     gs_regions_cap = (long)capacity;
@@ -297,6 +316,9 @@ GS_API void gs_release_regions(void) {
 #include <fcntl.h>
 
 static size_t gs_page_size = 0;
+#ifdef GS_HOSTED_JIT
+static void *gs_jit_fault_handler;
+#endif
 #define GS_COMMIT_CHUNK (1u << 20)
 /* What each thread program keeps of its native stack for reporting that
    stack's overflow (gs_native_stack_init). */
@@ -357,7 +379,11 @@ static size_t gs_os_page_size(void) {
 /* Installed once by main, before any worker can start. */
 static void gs_regions_init(void) {
     gs_page_size = gs_os_page_size();
-    if (!AddVectoredExceptionHandler(1, gs_fault_filter))
+    void *handler = AddVectoredExceptionHandler(1, gs_fault_filter);
+#ifdef GS_HOSTED_JIT
+    gs_jit_fault_handler = handler;
+#endif
+    if (!handler)
         gs_panic("cannot install data stack fault handler");
 }
 
@@ -416,6 +442,9 @@ static GS_TLS void *gs_sigstack;
 #define GS_SIGSTACK_MIN (64u << 10)
 /* What the fault handler replaced, for the faults that are not its own. */
 static struct sigaction gs_prev_segv, gs_prev_bus;
+#ifdef GS_HOSTED_JIT
+static int gs_jit_fault_installed;
+#endif
 
 /* For gs_trim_memory, which discards whole pages only. */
 static size_t gs_page_size = 0;
@@ -458,9 +487,15 @@ static void gs_regions_init(void) {
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     if (sigaction(SIGSEGV, &sa, &gs_prev_segv))
         gs_panic("cannot install data stack fault handler");
+#ifdef GS_HOSTED_JIT
+    gs_jit_fault_installed = 1;
+#endif
     #ifdef SIGBUS
         if (sigaction(SIGBUS, &sa, &gs_prev_bus))
             gs_panic("cannot install data stack fault handler");
+#ifdef GS_HOSTED_JIT
+        gs_jit_fault_installed |= 2;
+#endif
     #endif
 }
 
@@ -565,12 +600,16 @@ static GS_NORETURN void gs_park(void) {
 #endif
 
 static GS_NORETURN void gs_end(int code) {
+#ifdef GS_HOSTED_JIT
+    gs_jit_exit(code);
+#else
     if (!gs_end_first()) gs_park();
     fflush(NULL);
     #ifdef __TINYC__
         if (gs_current_thread_id < 0) exit(code);
     #endif
     _Exit(code);
+#endif
 }
 
 /* The smallest a region gets before a refusal is fatal. */
